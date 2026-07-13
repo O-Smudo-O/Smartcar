@@ -212,7 +212,7 @@ class SmartcarVehicle extends IPSModuleStrict
                 [
                     'type' => 'Button',
                     'caption' => '12-V-Batterie gezielt abrufen',
-                    'onClick' => 'SMCARV_FetchLowVoltageBatterySignals($id);'
+                    'onClick' => 'echo SMCARV_FetchLowVoltageBatterySignals($id);'
                 ],
                 [
                     'type'    => 'Label',
@@ -576,7 +576,7 @@ class SmartcarVehicle extends IPSModuleStrict
         );
     }
 
-    public function FetchLowVoltageBatterySignals(): void
+    public function FetchLowVoltageBatterySignals(): string
     {
         $selectedMap = $this->GetSelectedSignalMap();
         $signalCodes = [
@@ -601,6 +601,8 @@ class SmartcarVehicle extends IPSModuleStrict
                 'Bitte zuerst mindestens ein LowVoltageBattery-Signal in der Modulliste aktivieren und übernehmen.'
             );
         }
+
+        return (string)$this->GetValue('SignalFetchStatus');
     }
 
     public function ProcessWebhookSignals(string $payloadJson): void
@@ -1098,6 +1100,11 @@ class SmartcarVehicle extends IPSModuleStrict
     private function FetchSingleSelectedSignal(string $signalCode): void
     {
         if (!$this->HasParentConnection()) {
+            $this->RecordSignalFetchState(
+                $signalCode,
+                'PARENT_MISSING',
+                'Die Fahrzeug-Instanz ist nicht mit dem Smartcar Splitter verbunden.'
+            );
             return;
         }
 
@@ -1105,6 +1112,11 @@ class SmartcarVehicle extends IPSModuleStrict
         $userId = $this->ReadPropertyString('UserID');
 
         if ($vehicleId === '' || $userId === '') {
+            $this->RecordSignalFetchState(
+                $signalCode,
+                'CONFIG_MISSING',
+                'VehicleID oder UserID fehlt in der Fahrzeug-Instanz.'
+            );
             return;
         }
 
