@@ -212,7 +212,7 @@ class SmartcarVehicle extends IPSModuleStrict
                 [
                     'type' => 'Button',
                     'caption' => '12-V-Batterie gezielt abrufen',
-                    'onClick' => 'echo SMCARV_FetchLowVoltageBatterySignals($id);'
+                    'onClick' => 'echo 'onClick' => 'SMCARV_FetchLowVoltageBatterySignals($id); echo GetValue(IPS_GetObjectIDByIdent("SignalFetchStatus", $id));''
                 ],
                 [
                     'type'    => 'Label',
