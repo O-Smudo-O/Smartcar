@@ -17,6 +17,7 @@ class SmartcarVehicle extends IPSModuleStrict
     $this->RegisterPropertyString('SelectedCapabilities', '[]');
     $this->RegisterPropertyBoolean('ShowOEMUpdatedAtVariables', false);
     $this->RegisterAttributeString('LastOEMSignalTimes', '{}');
+    $this->RegisterAttributeString('SignalFetchStates', '{}');
     $this->RegisterAttributeString('CompatibilityCache', '[]');
     $this->RegisterAttributeInteger('CompatibilityCacheAt', 0);
 
@@ -28,6 +29,12 @@ class SmartcarVehicle extends IPSModuleStrict
         if ($lastSignalsId) {
             IPS_SetPosition($lastSignalsId, 10);
         }
+    }
+
+    $signalFetchStatusExists = (bool)@$this->GetIDForIdent('SignalFetchStatus');
+    $this->RegisterVariableString('SignalFetchStatus', 'Signalabruf-Status', '', 11);
+    if (!$signalFetchStatusExists) {
+        $this->SetValue('SignalFetchStatus', 'Noch keine Signalantwort empfangen.');
     }
 }
 
@@ -201,6 +208,11 @@ class SmartcarVehicle extends IPSModuleStrict
                     'type' => 'Button',
                     'caption' => 'Aktivierte Signale abrufen',
                     'onClick' => 'SMCARV_FetchSelectedSignals($id, []);'
+                ],
+                [
+                    'type' => 'Button',
+                    'caption' => '12-V-Batterie gezielt abrufen',
+                    'onClick' => 'SMCARV_FetchLowVoltageBatterySignals($id);'
                 ],
                 [
                     'type'    => 'Label',
@@ -454,6 +466,7 @@ class SmartcarVehicle extends IPSModuleStrict
         $decoded = json_decode((string)$result, true);
         if (!is_array($decoded) || empty($decoded['success'])) {
             $this->SendDebug('FetchSignals/Error', 'GetSignals fehlgeschlagen: ' . (string)$result, 0);
+            $this->RecordSignalFetchState('__request', 'REQUEST_ERROR', $this->ExtractApiError(is_array($decoded) ? $decoded : null, (string)$result));
             return;
         }
 
@@ -464,8 +477,12 @@ class SmartcarVehicle extends IPSModuleStrict
 
         if (!is_array($signals)) {
             $this->SendDebug('FetchSignals/Error', 'Keine Signals im Response gefunden.', 0);
+            $this->RecordSignalFetchState('__request', 'INVALID_RESPONSE', 'Keine Signalliste in der Smartcar-Antwort gefunden.');
             return;
         }
+
+        $pageCount = (int)($decoded['body']['meta']['loadedPageCount'] ?? 1);
+        $this->RecordSignalFetchState('__request', 'SUCCESS', 'Sammelabruf über ' . $pageCount . ' Seite(n) erfolgreich.');
 
         $selectedMap = $this->GetSelectedSignalMap();
 
@@ -476,17 +493,21 @@ class SmartcarVehicle extends IPSModuleStrict
 
         $applied = 0;
         $skipped = 0;
+        $seenMap = [];
 
         foreach ($signals as $signal) {
             if (!is_array($signal)) {
                 continue;
             }
 
-            $signalCode = (string)($signal['code'] ?? $signal['id'] ?? '');
+            $attributes = is_array($signal['attributes'] ?? null) ? $signal['attributes'] : $signal;
+            $signalCode = (string)($attributes['code'] ?? $signal['code'] ?? $signal['id'] ?? '');
             if ($signalCode === '') {
                 $skipped++;
                 continue;
             }
+
+            $seenMap[$signalCode] = true;
 
             if (!empty($onlyMap) && !isset($onlyMap[$signalCode])) {
                 $skipped++;
@@ -505,8 +526,6 @@ class SmartcarVehicle extends IPSModuleStrict
                 $skipped++;
                 continue;
             }
-
-            $attributes = is_array($signal['attributes'] ?? null) ? $signal['attributes'] : $signal;
 
             $body = is_array($attributes['body'] ?? null) ? $attributes['body'] : [];
             $status = is_array($attributes['status'] ?? null) ? $attributes['status'] : null;
@@ -538,6 +557,13 @@ class SmartcarVehicle extends IPSModuleStrict
             $applied++;
         }
 
+        $expectedMap = !empty($onlyMap) ? $onlyMap : $selectedMap;
+        foreach ($expectedMap as $signalCode => $_entry) {
+            if (!isset($seenMap[$signalCode])) {
+                $this->RecordSignalFetchState((string)$signalCode, 'NOT_RETURNED', 'Smartcar hat dieses Signal im vollständigen Listenabruf nicht geliefert.');
+            }
+        }
+
         $this->SendDebug(
             'FetchSignals/Done',
             json_encode([
@@ -548,6 +574,33 @@ class SmartcarVehicle extends IPSModuleStrict
             ]),
             0
         );
+    }
+
+    public function FetchLowVoltageBatterySignals(): void
+    {
+        $selectedMap = $this->GetSelectedSignalMap();
+        $signalCodes = [
+            'lowvoltagebattery-stateofcharge',
+            'lowvoltagebattery-status'
+        ];
+        $requested = 0;
+
+        foreach ($signalCodes as $signalCode) {
+            if (!isset($selectedMap[$signalCode])) {
+                continue;
+            }
+
+            $requested++;
+            $this->FetchSingleSelectedSignal($signalCode);
+        }
+
+        if ($requested === 0) {
+            $this->RecordSignalFetchState(
+                'lowvoltagebattery-stateofcharge',
+                'NOT_SELECTED',
+                'Bitte zuerst mindestens ein LowVoltageBattery-Signal in der Modulliste aktivieren und übernehmen.'
+            );
+        }
     }
 
     public function ProcessWebhookSignals(string $payloadJson): void
@@ -668,6 +721,77 @@ class SmartcarVehicle extends IPSModuleStrict
         return $map;
     }
 
+    private function ExtractApiError(?array $decoded, string $fallback): string
+    {
+        if (is_array($decoded)) {
+            $candidates = [
+                $decoded['error'] ?? null,
+                $decoded['body']['message'] ?? null,
+                $decoded['body']['error']['message'] ?? null,
+                $decoded['body']['error'] ?? null
+            ];
+
+            foreach ($candidates as $candidate) {
+                if (is_string($candidate) && trim($candidate) !== '') {
+                    return trim($candidate);
+                }
+            }
+
+            $encoded = json_encode($decoded, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            if (is_string($encoded) && $encoded !== '') {
+                return $encoded;
+            }
+        }
+
+        return $fallback !== '' ? $fallback : 'Unbekannter Smartcar-Fehler';
+    }
+
+    private function RecordSignalFetchState(string $signalCode, string $status, string $message = ''): void
+    {
+        $states = json_decode($this->ReadAttributeString('SignalFetchStates'), true);
+        if (!is_array($states)) {
+            $states = [];
+        }
+
+        $status = strtoupper(trim($status));
+        $message = trim($message);
+        if (strlen($message) > 500) {
+            $message = substr($message, 0, 497) . '...';
+        }
+
+        $states[$signalCode] = [
+            'status' => $status,
+            'message' => $message,
+            'updatedAt' => time()
+        ];
+
+        $this->WriteAttributeString(
+            'SignalFetchStates',
+            json_encode($states, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+        );
+
+        $okCount = 0;
+        $errorCount = 0;
+        foreach ($states as $state) {
+            $stateValue = strtoupper((string)($state['status'] ?? ''));
+            if ($stateValue === 'SUCCESS' || $stateValue === 'OK') {
+                $okCount++;
+            } else {
+                $errorCount++;
+            }
+        }
+
+        $summary = 'OK: ' . $okCount . ' | ohne gültigen Wert/Fehler: ' . $errorCount
+            . ' | zuletzt: ' . $signalCode . ' = ' . $status;
+        if ($message !== '') {
+            $summary .= ' (' . $message . ')';
+        }
+
+        if ((string)$this->GetValue('SignalFetchStatus') !== $summary) {
+            $this->SetValue('SignalFetchStatus', $summary);
+        }
+    }
+
     private function ApplySignalFromV3(string $code, array $body, ?array $status, array $definitionMeta, array $signalMeta = []): bool
     {
         if ($status !== null && isset($status['value'])) {
@@ -679,11 +803,17 @@ class SmartcarVehicle extends IPSModuleStrict
                     json_encode($status, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                     0
                 );
+                $this->RecordSignalFetchState(
+                    $code,
+                    $statusValue,
+                    json_encode($status, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)
+                );
                 return false;
             }
         }
 
         $changed = false;
+        $receivedValue = false;
         $definition = $this->GetSignalDefinition($code, $body);
         $variables = $this->GetVariablesFromDefinition($definition, $body);
 
@@ -701,6 +831,7 @@ class SmartcarVehicle extends IPSModuleStrict
                 continue;
             }
 
+            $receivedValue = true;
             $value = $body[$source];
 
             if (isset($variable['convert']) && is_callable($variable['convert'])) {
@@ -725,6 +856,7 @@ class SmartcarVehicle extends IPSModuleStrict
         if (empty($variables) && !empty($body)) {
             $ident = (string)($definition['ident'] ?? '');
             if ($ident !== '') {
+                $receivedValue = true;
                 $value = json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 
                 if ($this->TypedVariableValueDiffers($ident, $value, VARIABLETYPE_STRING)) {
@@ -783,6 +915,12 @@ class SmartcarVehicle extends IPSModuleStrict
             if ((int)$this->GetValue('LastSignalsAt') !== $now) {
                 $this->SetValue('LastSignalsAt', $now);
             }
+        }
+
+        if ($receivedValue) {
+            $this->RecordSignalFetchState($code, 'SUCCESS');
+        } else {
+            $this->RecordSignalFetchState($code, 'NO_VALUE', 'Signalantwort enthielt keinen auswertbaren Wert.');
         }
 
         return $changed;
@@ -981,6 +1119,7 @@ class SmartcarVehicle extends IPSModuleStrict
         $decoded = json_decode((string)$result, true);
         if (!is_array($decoded) || empty($decoded['success'])) {
             $this->SendDebug('FetchSignal/Error/' . $signalCode, (string)$result, 0);
+            $this->RecordSignalFetchState($signalCode, 'REQUEST_ERROR', $this->ExtractApiError(is_array($decoded) ? $decoded : null, (string)$result));
             return;
         }
 
@@ -989,10 +1128,20 @@ class SmartcarVehicle extends IPSModuleStrict
             ?? [];
 
         if (!is_array($signal)) {
+            $this->RecordSignalFetchState($signalCode, 'INVALID_RESPONSE', 'Smartcar hat kein Signalobjekt geliefert.');
             return;
         }
 
         $attributes = is_array($signal['attributes'] ?? null) ? $signal['attributes'] : $signal;
+
+        $returnedSignalCode = (string)($attributes['code'] ?? $signal['code'] ?? $signal['id'] ?? $signalCode);
+        if ($returnedSignalCode !== '' && $returnedSignalCode !== $signalCode) {
+            $this->SendDebug(
+                'FetchSignal/CodeMismatch',
+                'Angefordert=' . $signalCode . ', geliefert=' . $returnedSignalCode,
+                0
+            );
+        }
 
         $body = is_array($attributes['body'] ?? null) ? $attributes['body'] : [];
         $status = is_array($attributes['status'] ?? null) ? $attributes['status'] : null;
