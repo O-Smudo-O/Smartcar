@@ -289,7 +289,119 @@ class SmartcarSplitter extends IPSModuleStrict
 
     public function ApiGetSignals(string $vehicleId, string $userId = ''): array
     {
-        return $this->ApiRequest('GET', '/vehicles/' . rawurlencode($vehicleId) . '/signals', null, $userId);
+        $path = '/vehicles/' . rawurlencode($vehicleId) . '/signals';
+        $seenPaths = [];
+        $signals = [];
+        $firstBody = null;
+        $lastResponse = null;
+        $pageCount = 0;
+
+        while ($path !== '' && $pageCount < 100) {
+            if (isset($seenPaths[$path])) {
+                return [
+                    'success' => false,
+                    'error' => 'Pagination loop detected while loading vehicle signals',
+                    'body' => $firstBody ?? []
+                ];
+            }
+
+            $seenPaths[$path] = true;
+            $pageCount++;
+            $response = $this->ApiRequest('GET', $path, null, $userId);
+            $lastResponse = $response;
+
+            if (empty($response['success'])) {
+                $response['error'] = (string)($response['error'] ?? ('Signal page ' . $pageCount . ' could not be loaded'));
+                $response['page'] = $pageCount;
+                return $response;
+            }
+
+            $body = is_array($response['body'] ?? null) ? $response['body'] : [];
+            if ($firstBody === null) {
+                $firstBody = $body;
+            }
+
+            $pageSignals = $body['data'] ?? [];
+            if (!is_array($pageSignals)) {
+                return [
+                    'success' => false,
+                    'error' => 'Unexpected signal list response on page ' . $pageCount,
+                    'body' => $body
+                ];
+            }
+
+            foreach ($pageSignals as $signal) {
+                if (is_array($signal)) {
+                    $signals[] = $signal;
+                }
+            }
+
+            $next = $body['links']['next'] ?? null;
+            $path = is_string($next) ? $this->NormalizeVehicleApiPaginationPath($next) : '';
+
+            if (is_string($next) && $next !== '' && $path === '') {
+                return [
+                    'success' => false,
+                    'error' => 'Invalid pagination link returned by Smartcar',
+                    'body' => $body
+                ];
+            }
+        }
+
+        if ($path !== '') {
+            return [
+                'success' => false,
+                'error' => 'Signal pagination exceeded the safety limit of 100 pages',
+                'body' => $firstBody ?? []
+            ];
+        }
+
+        $result = is_array($lastResponse) ? $lastResponse : ['success' => false, 'error' => 'No response'];
+        $mergedBody = is_array($firstBody) ? $firstBody : [];
+        $mergedBody['data'] = $signals;
+        if (!is_array($mergedBody['meta'] ?? null)) {
+            $mergedBody['meta'] = [];
+        }
+        $mergedBody['meta']['loadedPageCount'] = $pageCount;
+        $mergedBody['meta']['loadedSignalCount'] = count($signals);
+        $result['body'] = $mergedBody;
+
+        $this->SendDebug('ApiGetSignals/Pagination', json_encode([
+            'pages' => $pageCount,
+            'signals' => count($signals)
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE), 0);
+
+        return $result;
+    }
+
+    private function NormalizeVehicleApiPaginationPath(string $link): string
+    {
+        $link = trim($link);
+        if ($link === '') {
+            return '';
+        }
+
+        if (str_starts_with($link, 'http://') || str_starts_with($link, 'https://')) {
+            $parts = parse_url($link);
+            if (!is_array($parts) || strtolower((string)($parts['host'] ?? '')) !== 'vehicle.api.smartcar.com') {
+                return '';
+            }
+
+            $link = (string)($parts['path'] ?? '');
+            if (isset($parts['query']) && $parts['query'] !== '') {
+                $link .= '?' . $parts['query'];
+            }
+        }
+
+        if (str_starts_with($link, '/v3/')) {
+            $link = substr($link, 3);
+        }
+
+        if (!str_starts_with($link, '/vehicles/')) {
+            return '';
+        }
+
+        return $link;
     }
 
     public function ApiGetSignal(string $vehicleId, string $signalCode, string $userId = ''): array
